@@ -34,7 +34,7 @@ class ScoringResult:
     detail: str
 
 
-# ========= 2. 프레임 추출 (기존 방식) =========
+# ========= 2. 프레임 추출 =========
 
 def extract_keyframes(video_path: str, num_frames: int = 8, resize_to=(640, 360)) -> List[np.ndarray]:
     cap = cv2.VideoCapture(video_path)
@@ -65,85 +65,16 @@ def frames_to_pil(frames: List[np.ndarray]) -> List[Image.Image]:
     return [Image.fromarray(f) for f in frames]
 
 
-def pil_to_base64(img: Image.Image, format="JPEG") -> str:
-    buf = io.BytesIO()
-    img.save(buf, format=format)
-    data = base64.b64encode(buf.getvalue()).decode("utf-8")
-    return f"data:image/{format.lower()};base64,{data}"
-
-
-# ========= 3A. 프레임 기반 VLM 분석(기존 함수) =========
-
-def analyze_frames_with_vlm(frames: List[Image.Image], duration_sec: float,
-                            model="gpt-4.1-mini") -> VLMAnalysisResult:
-
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        # API 없으면 더미값 반환
-        return VLMAnalysisResult(
-            test_type="squat",
-            reps=15,
-            duration_sec=duration_sec,
-            depth_quality="good",
-            knee_alignment="neutral",
-            tempo="steady",
-            stability="medium",
-            risk_flags=[]
-        )
-
-    client = OpenAI(api_key=api_key)
-
-    image_contents = []
-    for img in frames:
-        image_contents.append({
-            "type": "image_url",
-            "image_url": {"url": pil_to_base64(img)}
-        })
-
-    system_prompt = "프레임을 기반으로 스쿼트 동작 분석을 JSON으로만 출력하세요."
-    user_prompt = f"영상 길이는 {duration_sec:.1f}초입니다. JSON으로 분석해주세요."
-
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user",
-             "content": [
-                 {"type": "text", "text": user_prompt},
-                 *image_contents
-             ]}
-        ],
-        response_format={"type": "json_object"}
-    )
-
-    import json
-    data = json.loads(resp.choices[0].message.content)
-
-    return VLMAnalysisResult(
-        test_type=data.get("test_type", "squat"),
-        reps=int(data.get("reps", 0)),
-        duration_sec=duration_sec,
-        depth_quality=data.get("depth_quality", "fair"),
-        knee_alignment=data.get("knee_alignment", "neutral"),
-        tempo=data.get("tempo", "steady"),
-        stability=data.get("stability", "medium"),
-        risk_flags=data.get("risk_flags", [])
-    )
-
-
-# ========= 3B. mp4 직접 VLM 분석(신규 추가) =========
+# ========= 3. mp4 → VLM 분석 =========
 
 def analyze_video_with_vlm(video_bytes: bytes, duration_sec: float,
                            model="gpt-4.1") -> VLMAnalysisResult:
-    """
-    업로드한 mp4를 그대로 VLM에게 전달하여 운동 분석.
-    """
 
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         return VLMAnalysisResult(
             test_type="squat",
-            reps=12,
+            reps=10,
             duration_sec=duration_sec,
             depth_quality="fair",
             knee_alignment="neutral",
@@ -160,10 +91,23 @@ def analyze_video_with_vlm(video_bytes: bytes, duration_sec: float,
 
     system_prompt = """
 당신은 운동 평가 전문가 AI입니다.
-영상을 보고 운동 종류, 반복 수, 자세, 템포, 안정성, 위험요소를 JSON으로만 출력하세요.
+비디오를 보고 다음 JSON 형식으로만 출력하세요:
+
+{
+  "exercise_type": "squat",
+  "estimated_reps": 15,
+  "movement_quality": {
+      "depth": "good",
+      "knee_alignment": "neutral",
+      "back_posture": "stable"
+  },
+  "tempo": "steady",
+  "stability": "medium",
+  "risk_factors": []
+}
 """
 
-    user_prompt = f"영상 길이는 {duration_sec:.1f}초입니다. JSON으로 분석해 주세요."
+    user_prompt = f"영상 길이는 {duration_sec:.1f}초입니다. JSON으로만 분석해주세요."
 
     resp = client.chat.completions.create(
         model=model,
@@ -180,12 +124,14 @@ def analyze_video_with_vlm(video_bytes: bytes, duration_sec: float,
         response_format={"type": "json_object"}
     )
 
+    data = resp.choices[0].message.content
     import json
-    data = json.loads(resp.choices[0].message.content)
+    data = json.loads(data)
 
+    # JSON 매핑
     return VLMAnalysisResult(
-        test_type=data.get("exercise_type", data.get("test_type", "squat")),
-        reps=int(data.get("estimated_reps", data.get("reps", 0))),
+        test_type=data.get("exercise_type", "squat"),
+        reps=data.get("estimated_reps", 0),
         duration_sec=duration_sec,
         depth_quality=data.get("movement_quality", {}).get("depth", "fair"),
         knee_alignment=data.get("movement_quality", {}).get("knee_alignment", "neutral"),
@@ -195,11 +141,12 @@ def analyze_video_with_vlm(video_bytes: bytes, duration_sec: float,
     )
 
 
-# ========= 4. 점수화 (기존) =========
+# ========= 4. 점수화 =========
 
 def score_against_kfta(result: VLMAnalysisResult,
                        age_group: Optional[str],
                        gender: Optional[str]) -> ScoringResult:
+
     max_reps = 30
     reps_score = min(result.reps / max_reps * 60, 60)
 
@@ -231,7 +178,7 @@ def score_against_kfta(result: VLMAnalysisResult,
     return ScoringResult(is_valid, total, grade, detail)
 
 
-# ========= 5. 리포트 생성 (기존) =========
+# ========= 5. LLM 리포트 =========
 
 def generate_report_with_llm(analysis: VLMAnalysisResult, score: ScoringResult,
                              model="gpt-4.1-mini") -> str:
@@ -242,10 +189,15 @@ def generate_report_with_llm(analysis: VLMAnalysisResult, score: ScoringResult,
 
     client = OpenAI(api_key=api_key)
 
-    system_prompt = "당신은 국민체력100 운동 평가 전문가입니다."
+    system_prompt = "당신은 국민체력100 분석 전문가입니다."
     user_prompt = f"""
-반복수 {analysis.reps}, 깊이 {analysis.depth_quality}, 무릎 {analysis.knee_alignment},
-템포 {analysis.tempo}, 안정성 {analysis.stability}, 총점 {score.total_score}.
+반복수: {analysis.reps}
+스쿼트 깊이: {analysis.depth_quality}
+무릎 정렬: {analysis.knee_alignment}
+템포: {analysis.tempo}
+안정성: {analysis.stability}
+총점: {score.total_score}
+등급: {score.grade}
 """
 
     resp = client.chat.completions.create(
@@ -259,66 +211,72 @@ def generate_report_with_llm(analysis: VLMAnalysisResult, score: ScoringResult,
     return resp.choices[0].message.content
 
 
-# ========= 6. Streamlit UI =========
+# ========= 6. Streamlit UI (최종) =========
 
 def main():
     st.set_page_config(page_title="국민체력100 VLM 데모", layout="centered")
-    st.title("AI 기반 국민체력100 영상 분석 (mp4 → VLM)")
+    st.title("AI 기반 국민체력100 영상 분석 (mp4 업로드 전용)")
 
     uploaded = st.file_uploader("운동 영상 파일 업로드 (mp4)", type=["mp4"])
+
+    if uploaded:
+        st.video(uploaded)
 
     col1, col2 = st.columns(2)
     age_group = col1.selectbox("연령대", ["선택 안 함", "10대", "20대", "30대", "40대", "50대", "60대 이상"])
     gender = col2.selectbox("성별", ["선택 안 함", "남성", "여성"])
 
     if st.button("분석 실행", type="primary"):
+
         if uploaded is None:
-            st.error("mp4 파일을 업로드하세요.")
+            st.error("mp4 파일을 업로드해주세요.")
             return
 
-        # 영상 저장 (프레임 분석용)
-        video_path = "uploaded_video.mp4"
         video_bytes = uploaded.read()
 
+        # ---- 영상 길이 ----
+        video_path = "uploaded_video.mp4"
         with open(video_path, "wb") as f:
             f.write(video_bytes)
 
-        # 영상 길이
         cap = cv2.VideoCapture(video_path)
         duration_sec = cap.get(cv2.CAP_PROP_FRAME_COUNT) / max(cap.get(cv2.CAP_PROP_FPS), 1e-6)
         cap.release()
 
-        # 프레임 추출(백업)
-        with st.spinner("프레임 추출 중..."):
-            frames_np = extract_keyframes(video_path, num_frames=8)
+        # ---- 프레임 추출 (참고용) ----
+        with st.spinner("대표 프레임 추출 중..."):
+            frames_np = extract_keyframes(video_path)
 
-        # mp4 직접 VLM 분석
-        with st.spinner("VLM(mp4) 분석 중..."):
+        # ---- VLM(mp4) 분석 ----
+        with st.spinner("VLM이 영상을 분석 중입니다..."):
             analysis = analyze_video_with_vlm(video_bytes, duration_sec)
 
-        # 점수화
+        # ---- 점수화 ----
         score = score_against_kfta(
             analysis,
             None if age_group == "선택 안 함" else age_group,
-            None if gender == "선택 안 함" else gender
+            None if gender == "선택 안 함" else gender,
         )
 
-        # 리포트
+        # ---- 리포트 ----
         with st.spinner("AI 코치 리포트 생성 중..."):
             report = generate_report_with_llm(analysis, score)
 
+        # -----------------------------
         # 출력
-        st.subheader("① 추출된 대표 프레임 (참고용)")
+        # -----------------------------
+        st.subheader("1. 추출된 대표 프레임")
         st.image(frames_np, caption=[f"Frame {i+1}" for i in range(len(frames_np))], use_column_width=True)
 
-        st.subheader("② VLM 분석 결과(JSON)")
+        st.subheader("2. VLM 분석 결과(JSON)")
         st.json(analysis.__dict__)
 
-        st.subheader("③ 점수")
-        st.metric("총점", f"{score.total_score}/100")
-        st.metric("등급", f"{score.grade} 등급")
+        st.subheader("3. 점수 결과")
+        st.metric("총점", f"{score.total_score} / 100")
+        st.metric("예상 등급", f"{score.grade} 등급")
+        st.write(score.detail)
 
-        st.subheading = st.subheader("④ AI 코치 리포트")
+        st.subheader("4. AI 코치 리포트")
         st.markdown(report)
 
 
