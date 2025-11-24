@@ -1,5 +1,5 @@
-streamlit
-opencv-python-headless
-numpy
-pillow
-requests
+streamlit==1.36.0
+opencv-python-headless==4.7.0.72
+mediapipe==0.10.14
+numpy==1.26.4
+pillow==10.3.0
