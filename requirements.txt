@@ -1,7 +1,7 @@
 streamlit==1.41.1
-pytube==15.0.0
-opencv-python-headless==4.9.0.80
 numpy==1.26.4
+opencv-python-headless==4.9.0.80
 pillow==11.0.0
-openai==1.25.0
 requests==2.31.0
+pytube==15.0.0
+pandas==2.3.3
