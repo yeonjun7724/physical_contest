@@ -1,64 +1,67 @@
 import streamlit as st
 import cv2
-import base64
-import json
 import numpy as np
-from PIL import Image
-from io import BytesIO
+import base64
 import requests
+import json
+from PIL import Image
+import io
+import time
 
-# ------------------------------------------------------------
-# GPT-4o-mini Vision 호출 함수 (429 방지)
-# ------------------------------------------------------------
-def call_openai(messages):
-    url = "https://api.openai.com/v1/chat/completions"
+# -----------------------------------------------------
+# OpenAI Vision API 호출 (429/Timeout 방지 버전)
+# -----------------------------------------------------
+OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
+OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+MODEL_NAME = "gpt-4o-mini"
 
+def encode_frame(frame):
+    img = Image.fromarray(frame)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=60)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def call_openai_vision(messages, retries=6, delay=4):
     headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {st.secrets['OPENAI_API_KEY']}"
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
     }
 
     payload = {
-        "model": "gpt-4o-mini",
+        "model": MODEL_NAME,
         "messages": messages,
-        "max_tokens": 900
+        "max_tokens": 1400,
+        "temperature": 0.2
     }
 
-    # --- 재시도 로직 (429 방지) ---
-    for attempt in range(3):
-        response = requests.post(url, headers=headers, json=payload)
+    for i in range(retries):
+        try:
+            res = requests.post(OPENAI_URL, headers=headers, json=payload, timeout=15)
+            if res.status_code == 200:
+                return res.json()["choices"][0]["message"]["content"]
+            elif res.status_code == 429:
+                time.sleep(delay)
+            else:
+                time.sleep(delay)
+        except Exception:
+            time.sleep(delay)
 
-        if response.status_code == 429:
-            st.warning("API 사용량이 몰려 재시도 중입니다… (429 Too Many Requests)")
-            import time
-            time.sleep(3)
-            continue
+    raise RuntimeError("⚠ OpenAI API 오류: 여러 번 재시도했지만 응답이 없습니다.")
 
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"]
 
-    raise RuntimeError("OpenAI API가 3회 재시도에도 응답하지 않습니다.")
+# -----------------------------------------------------
+# 프레임 추출 (3개)
+# -----------------------------------------------------
+def extract_frames(video_bytes):
+    video = np.frombuffer(video_bytes, np.uint8)
+    cap = cv2.VideoCapture(cv2.imdecode(video, cv2.IMREAD_COLOR))
 
-# ------------------------------------------------------------
-# 이미지(base64로 변환)
-# ------------------------------------------------------------
-def pil_to_base64(pil_img):
-    buf = BytesIO()
-    pil_img.save(buf, format="JPEG")
-    return base64.b64encode(buf.getvalue()).decode()
-
-# ------------------------------------------------------------
-# 영상 → 프레임 n개 추출
-# ------------------------------------------------------------
-def extract_frames(video_bytes, n_frames=4):
-    np_video = np.frombuffer(video_bytes, np.uint8)
-    cap = cv2.VideoCapture(cv2.imdecode(np_video, cv2.IMREAD_COLOR))
-
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    idxs = [int(total * 0.2), int(total * 0.5), int(total * 0.8)]
     frames = []
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    idx_list = np.linspace(0, frame_count - 1, n_frames).astype(int)
 
-    for idx in idx_list:
+    for idx in idxs:
         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ret, frame = cap.read()
         if ret:
@@ -68,45 +71,44 @@ def extract_frames(video_bytes, n_frames=4):
     cap.release()
     return frames
 
-# ------------------------------------------------------------
-# 프레임 기반 운동 분석
-# ------------------------------------------------------------
-def analyze_frames_with_vlm(frames):
+
+# -----------------------------------------------------
+# VLM 분석 파이프라인
+# -----------------------------------------------------
+def analyze_exercise(frames):
     images_payload = []
 
-    for img in frames:
-        pil_img = Image.fromarray(img)
-        b64 = pil_to_base64(pil_img)
+    for f in frames:
+        b64 = encode_frame(f)
         images_payload.append({
             "type": "image_url",
-            "image_url": f"data:image/jpeg;base64,{b64}"
+            "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
         })
 
     system_prompt = """
-당신은 AI 기반 체력측정 전문가입니다.
-입력된 여러 이미지(프레임)를 보고 어떤 운동인지 판단하고,
-국민체력100 기준으로 평가하세요.
+당신은 대한민국 국민체력100 공식 기준을 잘 아는 AI 코치입니다.
+사용자가 업로드한 영상의 프레임을 보고 어떤 운동인지 분류하고,
+동작의 정확도, 반복수 추정, 코칭 포인트, 국민체력100 기준 점수/등급을 출력하세요.
 
-지원해야 하는 운동 종류:
-- 윗몸일으키기 (Sit-up)
-- 팔굽혀펴기 (Push-up)
-- 스쿼트 (Squat)
-- 플랭크 (Plank)
-- 버피 (Burpee)
-- 런지 (Lunge)
+지원 운동 목록:
+- 윗몸일으키기(Sit-up)
+- 팔굽혀펴기(Push-up)
+- 스쿼트(Squat)
+- 플랭크(Plank)
+- 버피(Burpee)
+- 런지(Lunge)
 - 제자리 점프 / 스텝박스 점프
-- 오래달리기(왕복달리기)
-- 종합 체력테스트 동작
+- 오래달리기(동작 패턴 보고 가능한 경우 설명)
+- 기타 복합 운동: 가장 가까운 운동으로 분류
 
-반드시 JSON 형식으로 답변:
+출력 형식(JSON ONLY):
 {
- "detected_exercise": "운동명",
- "explanation": "판단 근거",
- "score": {
-     "total_score": 숫자,
-     "grade": "등급",
-     "detail": "세부 내용"
- }
+  "exercise_type": "",
+  "rep_count_estimated": "",
+  "form_quality": "",
+  "coach_feedback": "",
+  "kfta_score_estimated": "",
+  "kfta_grade": ""
 }
 """
 
@@ -115,50 +117,51 @@ def analyze_frames_with_vlm(frames):
         {"role": "user", "content": images_payload}
     ]
 
-    result = call_openai(messages)
+    result = call_openai_vision(messages)
     return json.loads(result)
 
-# ------------------------------------------------------------
+
+# -----------------------------------------------------
 # Streamlit UI
-# ------------------------------------------------------------
-def main():
-    st.set_page_config(page_title="AI 체력측정 (VLM)", layout="wide")
-    st.title("💪 AI 기반 국민체력 100 자동 측정기")
-    st.write("업로드한 영상에서 자동으로 운동 종류를 인식하고 점수/등급을 분석합니다.")
+# -----------------------------------------------------
+st.set_page_config(
+    page_title="AI 국민체력100 운동 분석",
+    layout="wide"
+)
 
-    uploaded = st.file_uploader("📤 운동 영상 업로드 (mp4)", type=["mp4"])
+st.title("💪 AI 기반 국민체력100 운동 분석기 (Demo)")
+st.write("영상을 업로드하면 AI가 운동 종류를 인식하고, 자세·반복수·점수·코칭을 제공합니다.")
 
-    if not uploaded:
-        st.info("운동 영상을 업로드하세요.")
-        return
+video = st.file_uploader("🎥 운동 영상 업로드 (mp4)", type=["mp4"])
 
-    # 영상 처리
-    video_bytes = uploaded.read()
+if video is not None:
+    st.video(video)
 
-    st.subheader("1) 영상 프레임 미리보기")
-    frames = extract_frames(video_bytes, n_frames=4)
+    if st.button("🔍 운동 분석 실행"):
+        video_bytes = video.read()
 
-    cols = st.columns(4)
-    for i, f in enumerate(frames):
-        cols[i].image(f, caption=f"Frame {i+1}", use_container_width=True)
+        with st.spinner("🎬 영상을 분석 중입니다..."):
+            frames = extract_frames(video_bytes)
 
-    st.subheader("2) AI 분석 결과")
-    with st.spinner("🔥 VLM이 운동을 분석하는 중…"):
-        result = analyze_frames_with_vlm(frames)
+        st.write("### 📸 추출된 영상 프레임")
+        cols = st.columns(len(frames))
+        for i, f in enumerate(frames):
+            cols[i].image(f, caption=f"Frame {i+1}", use_column_width=True)
 
-    # 결과 표시
-    st.success("분석 완료!")
+        with st.spinner("🤖 AI가 운동을 분석 중입니다..."):
+            result = analyze_exercise(frames)
 
-    st.json(result)
+        st.success("분석 완료!")
 
-    st.subheader("3) 요약 결과")
-    st.metric("감지된 운동", result["detected_exercise"])
-    st.metric("총점", f"{result['score']['total_score']}점")
-    st.metric("예상 등급", result["score"]["grade"])
+        st.write("## 📝 분석 결과")
+        st.json(result)
 
-    st.write("### 세부 분석 리포트")
-    st.write(result["score"]["detail"])
+        st.write("## 🏅 AI 요약")
+        st.metric("운동 유형", result["exercise_type"])
+        st.metric("예상 반복수", result["rep_count_estimated"])
+        st.metric("자세 정확도", result["form_quality"])
+        st.metric("예상 점수", f"{result['kfta_score_estimated']} 점")
+        st.metric("예상 등급", result["kfta_grade"])
 
-# ------------------------------------------------------------
-if __name__ == "__main__":
-    main()
+        st.write("## 📘 AI 코치 피드백")
+        st.write(result["coach_feedback"])
