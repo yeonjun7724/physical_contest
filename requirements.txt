@@ -1,13 +1,5 @@
 streamlit==1.41.1
 opencv-python-headless==4.9.0.80
 numpy==1.26.4
-pillow==11.0.0
 requests==2.31.0
-python-dateutil==2.9.0.post0
-typing-extensions==4.15.0
-pydantic==2.12.4
-pydantic-core==2.41.5
-protobuf==5.29.5
-altair==5.5.0
-pandas==2.3.3
-pyarrow==22.0.0
+pillow==11.0.0
