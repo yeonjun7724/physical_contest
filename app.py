@@ -1,221 +1,197 @@
 import streamlit as st
+import cv2
+import numpy as np
 import base64
 import requests
-import os
 import json
+from io import BytesIO
+from PIL import Image
 
-# ------------------------------------------------------------
-# 1) OpenAI API (REST 방식)
-# ------------------------------------------------------------
+# ============================================================
+# 1) OpenAI REST API 호출 함수 (gpt-4o-mini)
+# ============================================================
+
 def call_openai(messages, model="gpt-4o-mini"):
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise ValueError("OPENAI_API_KEY 환경변수가 없습니다.")
+    api_key = st.secrets["OPENAI_API_KEY"]
 
     url = "https://api.openai.com/v1/chat/completions"
     headers = {
-        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}"
     }
     payload = {
         "model": model,
         "messages": messages,
         "max_tokens": 1500,
+        "temperature": 0.2,
     }
+
     response = requests.post(url, headers=headers, json=payload)
     response.raise_for_status()
     return response.json()["choices"][0]["message"]["content"]
 
 
-# ------------------------------------------------------------
-# 2) VLM 분석 함수
-# ------------------------------------------------------------
-def analyze_video_with_vlm(video_bytes, duration_sec):
-    b64 = base64.b64encode(video_bytes).decode()
-    video_url = f"data:video/mp4;base64,{b64}"
+# ============================================================
+# 2) 영상에서 N개의 프레임 추출
+# ============================================================
+
+def extract_frames(video_bytes, num_frames=8):
+    file_bytes = np.frombuffer(video_bytes, np.uint8)
+    video = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
+    if video is None:
+        # mp4는 imdecode가 아니고 VideoCapture 필요
+        temp_path = "temp_video.mp4"
+        with open(temp_path, "wb") as f:
+            f.write(video_bytes)
+
+        cap = cv2.VideoCapture(temp_path)
+    else:
+        cap = cv2.VideoCapture()
+
+    cap.open("temp_video.mp4")
+
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    idx_list = np.linspace(0, total - 1, num_frames).astype(int)
+
+    frames = []
+
+    for idx in idx_list:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frames.append(frame_rgb)
+
+    cap.release()
+    return frames
+
+
+# ============================================================
+# 3) VLM 분석 (프레임 + 운동 분류 + 코칭)
+# ============================================================
+
+def analyze_frames_with_vlm(frames):
+    # 프레임을 base64 이미지로 변환하여 LLM에 전달
+    images_payload = []
+    for f in frames:
+        img = Image.fromarray(f)
+        buf = BytesIO()
+        img.save(buf, format="JPEG")
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        images_payload.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
+        })
 
     system_prompt = """
-    당신은 국민체력100(국민체력인증센터) 전문 평가관입니다.
-    사용자가 업로드한 운동 영상을 아래 기준에 따라 분석하고,
-    JSON 형식으로 반환하세요.
+당신은 운동 분석 및 체력측정 전문가입니다.
+아래 프레임들을 보고 어떤 운동인지 자동으로 분류하고,
+자세 오류, 템포, 관절 가동 범위, 반동 여부, 신체정렬 등을 평가하세요.
 
-    ① 반복 속도(페이스)
-    ② 동작 정확성
-    ③ 신체 정렬(척추/골반/무릎 정렬)
-    ④ 상·하체 협응
-    ⑤ 안정성(흔들림)
-    ⑥ 반복수(예측 가능 시)
+지원 운동 리스트:
+1) Sit-up 2) Push-up 3) Squat 4) Plank 5) Burpee 6) Lunge
+7) Shuttle-run(왕복달리기) 8) Jump/Step-box Jump 9) 복합 체력측정 동작
 
-    JSON 예시:
-    {
-        "speed": "적절 | 빠름 | 느림",
-        "accuracy": "우수 | 보통 | 부족",
-        "alignment": "정상 | 틀어짐 | 불안정",
-        "coordination": "우수 | 양호 | 부족",
-        "stability": "안정적 | 흔들림 있음",
-        "repetition_est": 24,
-        "notes": "허리가 약간 후만됨, 양손 움직임 불규칙"
-    }
-    """
+출력 형식(JSON):
+{
+  "exercise_type": "운동명",
+  "analysis": "자세 평가 요약",
+  "recommendation": "개선 포인트",
+  "score_components": {
+      "posture": 0~40,
+      "tempo": 0~20,
+      "range_of_motion": 0~20,
+      "stability": 0~20
+  }
+}
+"""
 
     messages = [
         {"role": "system", "content": system_prompt},
-        {
-            "role": "user",
-            "content": [
-                {"type": "input_text", "text": "운동 영상을 분석해 주세요."},
-                {"type": "input_video", "video_url": video_url, "mime_type": "video/mp4"},
-            ],
-        },
+        {"role": "user", "content": images_payload}
     ]
 
     result = call_openai(messages)
     return json.loads(result)
 
 
-# ------------------------------------------------------------
-# 3) 국민체력100 기반 점수화 알고리즘
-# ------------------------------------------------------------
-def score_kfta(analysis):
-    score = 0
+# ============================================================
+# 4) 점수 계산 (국민체력100 스타일)
+# ============================================================
 
-    map_score = {
-        "우수": 20,
-        "정상": 20,
-        "적절": 20,
-        "양호": 20,
-        "안정적": 20,
+def score_kfta(result_json):
+    comp = result_json["score_components"]
 
-        "보통": 12,
-        "다소 부족": 10,
-        "흔들림 있음": 10,
-        "느림": 10,
-        "빠름": 10,
+    total = comp["posture"] + comp["tempo"] + comp["range_of_motion"] + comp["stability"]
 
-        "부족": 6,
-        "불안정": 6,
-        "틀어짐": 6
-    }
-
-    for k, v in analysis.items():
-        if isinstance(v, str):
-            score += map_score.get(v, 0)
-
-    total = min(score, 100)
-
-    if total >= 90:
-        grade = "A"
-    elif total >= 75:
-        grade = "B"
-    elif total >= 60:
-        grade = "C"
+    if total >= 85:
+        grade = "상"
+    elif total >= 70:
+        grade = "중"
     else:
-        grade = "D"
+        grade = "하"
 
     return total, grade
 
 
-# ------------------------------------------------------------
-# 4) Streamlit UX/UI + 기능
-# ------------------------------------------------------------
+# ============================================================
+# 5) Streamlit UI
+# ============================================================
+
 def main():
-    st.set_page_config(
-        page_title="국민체력 100 AI 분석기",
-        layout="wide",
-    )
+    st.set_page_config(page_title="AI 체력측정 분석기", layout="wide")
 
-    st.markdown("""
-    <style>
-        .big-title { font-size: 32px; font-weight: 800; }
-        .sub { color:#666; font-size:15px; }
-        .box { padding:18px; border-radius:12px; background:#f8f9fa; border:1px solid #e5e7eb; }
-    </style>
-    """, unsafe_allow_html=True)
+    st.title("🏋️‍♂️ AI 영상 기반 체력측정 분석기 (Sit-up, Push-up, Squat, Plank, Burpee 등)")
 
-    st.markdown("<div class='big-title'>🏋️ 국민체력 100 - AI 운동 분석기</div>", unsafe_allow_html=True)
-    st.markdown("<div class='sub'>영상 기반 자동 분석 · VLM(gpt-4o-mini)</div>", unsafe_allow_html=True)
-    st.write("")
+    st.write("업로드한 영상을 기반으로 **운동을 자동으로 분류하고**, 자세 분석 + 점수화(국민체력100 스타일)를 수행합니다.")
 
-    col1, col2 = st.columns([1, 2])
+    st.subheader("1. 영상 업로드")
+    video = st.file_uploader("MP4 파일 업로드", type=["mp4"])
 
-    # ---------------- 좌측 설명 ----------------
-    with col1:
-        st.markdown("<div class='box'>", unsafe_allow_html=True)
-        st.markdown("### 📌 분석 항목")
-        st.markdown("""
-        - 반복 속도(페이스)
-        - 동작 정확성
-        - 신체 정렬(척추/골반/무릎)
-        - 상·하체 협응도
-        - 안정성(흔들림)
-        - 반복수 추정
-        """)
-        st.markdown("### 📌 계산 기준")
-        st.markdown("""
-        **국민체력100 공식 등급 체계 기반**
-        - 90점 이상: A  
-        - 75점 이상: B  
-        - 60점 이상: C  
-        - 그 이하: D  
-        """)
-        st.markdown("</div>", unsafe_allow_html=True)
+    if video is not None:
+        video_bytes = video.read()
 
-    # ---------------- 우측 영상 업로드 ----------------
-    with col2:
-        st.markdown("### 🎥 운동 영상 업로드")
-        video = st.file_uploader("MP4 파일만 업로드 가능합니다.", type=["mp4"])
+        st.video(video_bytes)
 
-        duration_sec = st.number_input("📏 영상 길이(초)", 1, 300, 10)
+        st.subheader("2. 분석 실행")
+        if st.button("🚀 분석 시작"):
+            with st.spinner("영상에서 프레임 추출 중…"):
+                frames = extract_frames(video_bytes, num_frames=8)
 
-        if video is not None:
-            st.video(video)
+            st.success(f"프레임 {len(frames)}개 추출 완료")
 
-        if video and st.button("🚀 AI 분석 시작"):
-            st.info("영상 분석 중입니다… 약 10~20초 소요됩니다.")
+            st.subheader("샘플 프레임 확인")
+            cols = st.columns(4)
+            for i, f in enumerate(frames[:4]):
+                with cols[i]:
+                    st.image(f, caption=f"Frame {i+1}")
 
-            video_bytes = video.read()
-
-            with st.spinner("VLM이 영상을 분석 중…"):
-                analysis = analyze_video_with_vlm(video_bytes, duration_sec)
+            with st.spinner("AI VLM이 운동을 분석하는 중…"):
+                result = analyze_frames_with_vlm(frames)
 
             st.success("분석 완료!")
 
-            st.subheader("📊 분석 결과(JSON)")
-            st.json(analysis)
+            # 결과 출력
+            st.subheader("3. AI 분석 결과")
+            st.json(result)
 
-            total, grade = score_kfta(analysis)
+            total, grade = score_kfta(result)
 
-            # ---------------- 점수 카드 ----------------
-            st.markdown("### 🏅 국민체력100 점수")
+            st.subheader("4. 점수 결과 (국민체력100 스타일)")
             st.metric("총점", f"{total} / 100")
             st.metric("등급", grade)
 
-            # ---------------- AI 리포트 ----------------
-            report_prompt = f"""
-            당신은 국민체력100 전문 평가관입니다.
-            아래 JSON을 기반으로 운동 평가 리포트를 작성하세요.
-
-            {json.dumps(analysis, ensure_ascii=False)}
-
-            요구사항:
-            - 국민체력100 결과지 말투
-            - 개선점 5가지
-            - 속도·정확성·정렬·안정성·협응에 대한 평가
-            - 훈련 팁 포함
-            """
-
-            messages = [
-                {"role": "system", "content": "당신은 국민체력100 공식 평가관입니다."},
-                {"role": "user", "content": report_prompt},
-            ]
-
-            with st.spinner("AI 리포트 생성 중…"):
-                report = call_openai(messages)
-
-            st.subheader("📄 AI 코치 리포트")
-            st.write(report)
+            st.subheader("5. AI 코치 피드백")
+            st.write(result["analysis"])
+            st.write("### 개선 포인트")
+            st.write(result["recommendation"])
 
 
-# ------------------------------------------------------------
+# ============================================================
+# 6) 실행
+# ============================================================
+
 if __name__ == "__main__":
     main()
