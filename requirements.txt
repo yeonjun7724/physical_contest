@@ -1,0 +1,14 @@
+streamlit==1.34.0
+pytube==15.0.0
+opencv-python==4.9.0.80
+numpy==1.26.4
+pillow==10.3.0
+
+# OpenAI (새 SDK)
+openai==1.35.10
+
+# (선택) 영상 다운로드 안정성 추가 라이브러리
+requests==2.31.0
+
+# (선택) JSON 파싱 안정성
+orjson==3.10.3
