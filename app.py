@@ -1,48 +1,39 @@
 import os
 import io
+import json
+import time
 import tempfile
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import cv2
 import numpy as np
 from PIL import Image
 import streamlit as st
-import mediapipe as mp
 
 # ============================================================
-# 1. Streamlit 기본 설정
+# 1. 국민체력100 점수 테이블 (예시 값 유지)
 # ============================================================
 
-st.set_page_config(page_title="국민체력100 운동 분석 (MediaPipe 버전)", layout="wide")
-
-st.title("🏋️‍♂️ AI 없이도 동작하는 국민체력100 운동 분석 웹앱 (MediaPipe Pose)")
-
-st.markdown(
-    """
-이 웹앱은 **OpenAI / 클라우드 API 없이** 로컬에서 실행 가능한 **MediaPipe Pose** 기반 운동 분석 도구입니다.  
-
-- 업로드한 **운동 영상(mp4)** 을 프레임 단위로 읽어,
-- **MediaPipe Pose** 로 관절을 추출하고,
-- 운동 종류(푸시업/스쿼트/윗몸일으키기/플랭크/그 외)를 **간단한 규칙 기반으로 분류**하고,
-- **반복 횟수(또는 플랭크 유지 시간)를 추정**한 뒤,
-- 기본적인 **국민체력100 예시 점수표**를 활용해 점수를 계산합니다.
-
-> 실제 평가에 쓰기 전에는 반드시 충분한 테스트와 보정이 필요합니다. (연구/프로토타입 용도)
 """
-)
+실제 국민체력100 공식 점수표를 그대로 옮겨서 아래 딕셔너리에 넣으면 됨.
+현재 숫자는 "예시 값"이므로, 반드시 공식 자료 보고 수정해야 함.
 
-# ============================================================
-# 2. MediaPipe Pose 설정
-# ============================================================
+구조:
+KFTA_SCORES[exercise_key][gender][age_group] = [
+    (기준값, 점수),
+    (기준값, 점수),
+    ...
+    (0, 0)
+]
 
-mp_pose = mp.solutions.pose
-mp_drawing = mp.solutions.drawing_utils
-
-# ============================================================
-# 3. KFTA 점수표 (예시값 – 연준이 쓰던 구조 그대로)
-# ============================================================
+- exercise_key: "situp", "pushup", "plank", "shuttle_run" 등
+- gender: "male", "female"
+- age_group: "10대", "20대", "30대", "40대", "50대", "60대 이상"
+- situp/pushup 등: reps(횟수) 기준, plank: seconds(초), shuttle_run: 왕복 횟수 등
+"""
 
 KFTA_SCORES: Dict[str, Dict[str, Dict[str, List[Tuple[float, int]]]]] = {
+    # 윗몸일으키기 (예시 값)
     "situp": {
         "male": {
             "10대": [(55, 100), (50, 90), (45, 80), (40, 70), (35, 60), (30, 50), (25, 40), (20, 30), (15, 20), (10, 10), (0, 0)],
@@ -61,6 +52,7 @@ KFTA_SCORES: Dict[str, Dict[str, Dict[str, List[Tuple[float, int]]]]] = {
             "60대 이상": [(28, 100), (23, 90), (18, 80), (13, 70), (9, 60), (6, 50), (4, 40), (2, 30), (1, 20), (0, 10), (0, 0)],
         },
     },
+    # 팔굽혀펴기 (예시 값)
     "pushup": {
         "male": {
             "10대": [(45, 100), (40, 90), (35, 80), (30, 70), (25, 60), (20, 50), (15, 40), (10, 30), (5, 20), (2, 10), (0, 0)],
@@ -79,6 +71,7 @@ KFTA_SCORES: Dict[str, Dict[str, Dict[str, List[Tuple[float, int]]]]] = {
             "60대 이상": [(16, 100), (13, 90), (10, 80), (7, 70), (5, 60), (3, 50), (2, 40), (1, 30), (0, 20), (0, 10), (0, 0)],
         },
     },
+    # 플랭크 (초 단위, 예시)
     "plank": {
         "male": {
             "10대": [(180, 100), (150, 90), (120, 80), (90, 70), (60, 60), (45, 50), (30, 40), (20, 30), (10, 20), (5, 10), (0, 0)],
@@ -97,20 +90,28 @@ KFTA_SCORES: Dict[str, Dict[str, Dict[str, List[Tuple[float, int]]]]] = {
             "60대 이상": [(90, 100), (70, 90), (55, 80), (40, 70), (28, 60), (18, 50), (10, 40), (6, 30), (3, 20), (1, 10), (0, 0)],
         },
     },
+    # 왕복 오래달리기 (왕복 수, 예시 값)
+    "shuttle_run": {
+        "male": {
+            "10대": [(60, 100), (55, 90), (50, 80), (45, 70), (40, 60), (35, 50), (30, 40), (25, 30), (20, 20), (15, 10), (0, 0)],
+            "20대": [(55, 100), (50, 90), (45, 80), (40, 70), (35, 60), (30, 50), (25, 40), (20, 30), (15, 20), (10, 10), (0, 0)],
+            "30대": [(50, 100), (45, 90), (40, 80), (35, 70), (30, 60), (25, 50), (20, 40), (15, 30), (10, 20), (5, 10), (0, 0)],
+            "40대": [(45, 100), (40, 90), (35, 80), (30, 70), (25, 60), (20, 50), (15, 40), (10, 30), (7, 20), (3, 10), (0, 0)],
+            "50대": [(40, 100), (35, 90), (30, 80), (25, 70), (20, 60), (15, 50), (10, 40), (7, 30), (4, 20), (2, 10), (0, 0)],
+            "60대 이상": [(35, 100), (30, 90), (25, 80), (20, 70), (15, 60), (10, 50), (7, 40), (4, 30), (2, 20), (1, 10), (0, 0)],
+        },
+        "female": {
+            "10대": [(50, 100), (45, 90), (40, 80), (35, 70), (30, 60), (25, 50), (20, 40), (15, 30), (10, 20), (5, 10), (0, 0)],
+            "20대": [(45, 100), (40, 90), (35, 80), (30, 70), (25, 60), (20, 50), (15, 40), (10, 30), (7, 20), (3, 10), (0, 0)],
+            "30대": [(40, 100), (35, 90), (30, 80), (25, 70), (20, 60), (15, 50), (10, 40), (7, 30), (4, 20), (2, 10), (0, 0)],
+            "40대": [(35, 100), (30, 90), (25, 80), (20, 70), (16, 60), (12, 50), (8, 40), (5, 30), (3, 20), (1, 10), (0, 0)],
+            "50대": [(30, 100), (25, 90), (20, 80), (16, 70), (12, 60), (9, 50), (6, 40), (4, 30), (2, 20), (1, 10), (0, 0)],
+            "60대 이상": [(25, 100), (20, 90), (16, 80), (12, 70), (9, 60), (6, 50), (4, 40), (2, 30), (1, 20), (0, 10), (0, 0)],
+        },
+    },
 }
 
-# shuttle_run은 예시만 (지금 MediaPipe로 자동 인식하진 않지만 구조 유지)
-KFTA_SCORES["shuttle_run"] = {
-    "male": {
-        "10대": [(60, 100), (55, 90), (50, 80), (45, 70), (40, 60), (35, 50), (30, 40), (25, 30), (20, 20), (15, 10), (0, 0)],
-        "20대": [(55, 100), (50, 90), (45, 80), (40, 70), (35, 60), (30, 50), (25, 40), (20, 30), (15, 20), (10, 10), (0, 0)],
-    },
-    "female": {
-        "10대": [(50, 100), (45, 90), (40, 80), (35, 70), (30, 60), (25, 50), (20, 40), (15, 30), (10, 20), (5, 10), (0, 0)],
-        "20대": [(45, 100), (40, 90), (35, 80), (30, 70), (25, 60), (20, 50), (15, 40), (10, 30), (7, 20), (3, 10), (0, 0)],
-    },
-}
-
+# 공식 항목이 아닌 운동은 "연구용 점수" 처리
 NON_KFTA_EXERCISES = {"squat", "burpee", "lunge", "jump", "mixed"}
 
 EXERCISE_KEY_TO_NAME_KR = {
@@ -122,66 +123,23 @@ EXERCISE_KEY_TO_NAME_KR = {
     "lunge": "런지",
     "jump": "제자리 점프/스텝박스 점프",
     "shuttle_run": "왕복 오래달리기",
-    "mixed": "혼합/기타",
+    "mixed": "종합 체력 측정(혼합 동작)",
 }
 
-# ============================================================
-# 4. 기하학 유틸
-# ============================================================
-
-def angle_between(v1: np.ndarray, v2: np.ndarray) -> float:
-    """두 벡터 사이 각도 (deg)"""
-    v1 = v1.astype(float)
-    v2 = v2.astype(float)
-    if np.linalg.norm(v1) == 0 or np.linalg.norm(v2) == 0:
-        return 0.0
-    cos = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
-    cos = np.clip(cos, -1.0, 1.0)
-    return float(np.degrees(np.arccos(cos)))
-
-
-def joint_angle(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
-    """관절 B 기준 각도 (A-B-C, deg)"""
-    return angle_between(a - b, c - b)
-
-
-def moving_average(arr: np.ndarray, window: int = 5) -> np.ndarray:
-    if len(arr) < window:
-        return arr
-    cumsum = np.cumsum(np.insert(arr, 0, 0))
-    return (cumsum[window:] - cumsum[:-window]) / float(window)
-
-
-def count_reps_from_series(series: np.ndarray, low_th: float, high_th: float) -> int:
-    """
-    시계열 데이터를 기준으로 up↔down 사이클 수를 세는 간단한 카운터.
-    - series: 각도 또는 위치 시계열
-    - low_th: 'down' 기준 값
-    - high_th: 'up' 기준 값
-    """
-    if len(series) == 0:
-        return 0
-    state = "up"
-    reps = 0
-    for v in series:
-        if state == "up" and v < low_th:
-            state = "down"
-        elif state == "down" and v > high_th:
-            state = "up"
-            reps += 1
-    return reps
 
 # ============================================================
-# 5. 비디오 분석 (MediaPipe Pose)
+# 2. 비디오 → 프레임 추출 (OpenCV만 사용)
 # ============================================================
 
-def analyze_video_with_mediapipe(video_bytes: bytes) -> Tuple[Dict[str, Any], List[np.ndarray]]:
+def extract_frames_from_video_bytes(
+    video_bytes: bytes,
+    num_frames: int = 4,
+    resize_to: Tuple[int, int] = (640, 360),
+) -> Tuple[List[np.ndarray], float]:
     """
-    mp4 바이트 → MediaPipe Pose 분석 → 운동 분류 + 반복수 추정
-    return:
-        analysis_dict, preview_frames(list of RGB np.ndarray)
+    mp4 바이트 → 임시파일 → OpenCV로 프레임 균등 추출.
+    return: (frames(RGB np.ndarray list), duration_sec)
     """
-    # 임시 파일 저장
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
         tmp.write(video_bytes)
         tmp_path = tmp.name
@@ -193,242 +151,59 @@ def analyze_video_with_mediapipe(video_bytes: bytes) -> Tuple[Dict[str, Any], Li
         raise RuntimeError("영상 파일을 열 수 없습니다.")
 
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
-    duration = frame_count / fps if frame_count > 0 else 0.0
+    fps = cap.get(cv2.CAP_PROP_FPS) or 0.000001
+    duration_sec = frame_count / fps if frame_count > 0 else 0.0
 
-    # 분석용 샘플링 간격 (약 3fps 수준)
-    step = max(1, int(round(fps / 3)))
-    preview_step = max(1, frame_count // 4) if frame_count > 0 else step
+    if frame_count <= 0:
+        cap.release()
+        os.remove(tmp_path)
+        raise RuntimeError("영상에서 프레임 정보를 읽을 수 없습니다.")
 
-    torso_angles = []
-    knee_angles = []
-    elbow_angles = []
-    hip_heights = []
+    # 균등 간격 인덱스
+    idxs = np.linspace(0, frame_count - 1, num_frames, dtype=int)
 
-    preview_frames: List[np.ndarray] = []
-
-    with mp_pose.Pose(
-        static_image_mode=False,
-        model_complexity=1,
-        enable_segmentation=False,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    ) as pose:
-        idx = 0
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            # 프리뷰용 이미지 저장 (4장 정도)
-            if idx % preview_step == 0:
-                rgb_small = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                rgb_small = cv2.resize(rgb_small, (640, 360))
-                preview_frames.append(rgb_small)
-
-            # 분석용 샘플링
-            if idx % step == 0:
-                h, w, _ = frame.shape
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                result = pose.process(rgb)
-
-                if result.pose_landmarks:
-                    lm = result.pose_landmarks.landmark
-
-                    def get_xy(name: int) -> np.ndarray:
-                        return np.array([lm[name].x * w, lm[name].y * h])
-
-                    # 주요 관절 좌표
-                    ls = get_xy(mp_pose.PoseLandmark.LEFT_SHOULDER)
-                    rs = get_xy(mp_pose.PoseLandmark.RIGHT_SHOULDER)
-                    lh = get_xy(mp_pose.PoseLandmark.LEFT_HIP)
-                    rh = get_xy(mp_pose.PoseLandmark.RIGHT_HIP)
-                    lk = get_xy(mp_pose.PoseLandmark.LEFT_KNEE)
-                    rk = get_xy(mp_pose.PoseLandmark.RIGHT_KNEE)
-                    la = get_xy(mp_pose.PoseLandmark.LEFT_ANKLE)
-                    ra = get_xy(mp_pose.PoseLandmark.RIGHT_ANKLE)
-                    le = get_xy(mp_pose.PoseLandmark.LEFT_ELBOW)
-                    re = get_xy(mp_pose.PoseLandmark.RIGHT_ELBOW)
-                    lw = get_xy(mp_pose.PoseLandmark.LEFT_WRIST)
-                    rw = get_xy(mp_pose.PoseLandmark.RIGHT_WRIST)
-
-                    shoulder = (ls + rs) / 2.0
-                    hip = (lh + rh) / 2.0
-                    knee = (lk + rk) / 2.0
-                    ankle = (la + ra) / 2.0
-                    elbow = (le + re) / 2.0
-                    wrist = (lw + rw) / 2.0
-
-                    # 몸통 각도 (0 = 수직, 90 = 수평에 가까움)
-                    torso_vec = shoulder - hip
-                    vertical_vec = np.array([0, -1])
-                    torso_angle = angle_between(torso_vec, vertical_vec)
-                    torso_angles.append(torso_angle)
-
-                    # 무릎 각도 (스쿼트/런지/PJ 등에 사용)
-                    knee_angle = joint_angle(hip, knee, ankle)
-                    knee_angles.append(knee_angle)
-
-                    # 팔꿈치 각도 (푸시업 등에 사용)
-                    elbow_angle = joint_angle(shoulder, elbow, wrist)
-                    elbow_angles.append(elbow_angle)
-
-                    # 엉덩이 높이 (정규화)
-                    hip_height = hip[1] / h
-                    hip_heights.append(hip_height)
-
-            idx += 1
+    frames: List[np.ndarray] = []
+    for idx in idxs:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame = cv2.resize(frame, resize_to)
+        frames.append(frame)
 
     cap.release()
     os.remove(tmp_path)
 
-    torso_arr = np.array(torso_angles)
-    knee_arr = np.array(knee_angles)
-    elbow_arr = np.array(elbow_angles)
-    hip_arr = np.array(hip_heights)
+    if not frames:
+        raise RuntimeError("프레임을 추출하지 못했습니다.")
 
-    if len(preview_frames) == 0:
-        raise RuntimeError("포즈를 인식할 수 있는 프레임이 없습니다.")
+    return frames, float(duration_sec)
 
-    if len(torso_arr) == 0:
-        # 포즈 추출 실패
-        analysis = {
-            "exercise_key": "mixed",
-            "exercise_name_kr": "혼합/인식 불가",
-            "reps": 0,
-            "metric_type": "reps",
-            "metric_value": 0,
-            "posture_quality": "unknown",
-            "intensity": "unknown",
-            "stability": "unknown",
-            "notes": "사람 포즈를 안정적으로 인식하지 못했습니다. 카메라 구도/조명/거리 등을 조정해 주세요.",
-            "video_duration_sec": duration,
-        }
-        return analysis, preview_frames[:4]
-
-    # 간단 통계
-    torso_mean, torso_std = float(torso_arr.mean()), float(torso_arr.std())
-    knee_std = float(knee_arr.std()) if len(knee_arr) else 0.0
-    elbow_std = float(elbow_arr.std()) if len(elbow_arr) else 0.0
-    hip_std = float(hip_arr.std()) if len(hip_arr) else 0.0
-
-    # 시계열 smoothing
-    torso_sm = moving_average(torso_arr, window=5)
-    knee_sm = moving_average(knee_arr, window=5)
-    elbow_sm = moving_average(elbow_arr, window=5)
-
-    exercise_key = "mixed"
-    reps = 0
-    metric_type = "reps"
-    metric_value = 0.0
-    posture_quality = "fair"
-    intensity = "moderate"
-    stability = "medium"
-    notes = []
-
-    # ----------- 분류 규칙 -----------
-
-    # 1) 플랭크: 수평에 가깝고, 움직임이 거의 없음
-    if torso_mean > 50 and torso_std < 8 and knee_std < 8 and elbow_std < 8 and hip_std < 0.01:
-        exercise_key = "plank"
-        metric_type = "seconds"
-        metric_value = duration
-        reps = 1
-        posture_quality = "good"
-        stability = "high"
-        intensity = "moderate"
-        notes.append("몸통과 엉덩이 움직임이 거의 없어 플랭크로 추정됩니다.")
-
-    # 2) 푸시업: 수평 + 팔꿈치 각도 변화 큼 + 엉덩이 높이 변화는 상대적으로 적음
-    elif torso_mean > 40 and elbow_std > 15 and hip_std < 0.05:
-        exercise_key = "pushup"
-        low, high = 100, 150
-        reps = count_reps_from_series(elbow_sm, low_th=low, high_th=high)
-        metric_type = "reps"
-        metric_value = float(reps)
-        posture_quality = "good" if hip_std < 0.03 else "fair"
-        stability = "medium"
-        intensity = "high" if reps >= 20 else "moderate"
-        notes.append("수평 자세에서 팔꿈치 굽힘/펴짐 패턴이 반복되어 팔굽혀펴기로 추정됩니다.")
-
-    # 3) 스쿼트: 수직 + 무릎 각도 변화 큼 + 엉덩이 높이 변화 큼
-    elif torso_mean < 40 and knee_std > 15 and hip_std > 0.03:
-        exercise_key = "squat"
-        low, high = 140, 170  # 내려갈 때 각도 작아지고(굽힘), 올라올 때 커짐
-        reps = count_reps_from_series(knee_sm * -1.0, low_th=-170, high_th=-140)  # 간단한 변형
-        if reps == 0:
-            # 그냥 knee_series로 직접 세기
-            reps = count_reps_from_series(knee_sm, low_th=120, high_th=160)
-        metric_type = "reps"
-        metric_value = float(reps)
-        posture_quality = "good" if knee_std > 25 else "fair"
-        stability = "medium"
-        intensity = "high" if reps >= 20 else "moderate"
-        notes.append("무릎 굽힘/펴짐과 엉덩이 상하 이동이 반복되어 스쿼트로 추정됩니다.")
-
-    # 4) 윗몸일으키기: 수평+수직 사이에서 몸통 각도 변화 큼, 무릎/엉덩이는 비교적 안정
-    elif torso_std > 20 and knee_std < 10:
-        exercise_key = "situp"
-        low, high = 20, 60  # 누운 상태(수평에 가까움) ↔ 일어난 상태(수직에 가까움)
-        reps = count_reps_from_series(torso_sm, low_th=low, high_th=high)
-        metric_type = "reps"
-        metric_value = float(reps)
-        posture_quality = "fair"
-        stability = "medium"
-        intensity = "high" if reps >= 30 else "moderate"
-        notes.append("상체 기울기 변화가 반복되어 윗몸일으키기로 추정됩니다.")
-
-    # 5) 위 규칙에 안 걸리면 혼합 동작 처리
-    else:
-        exercise_key = "mixed"
-        metric_type = "reps"
-        # 가장 크게 움직인 각도로 임의 반복수 추정
-        stds = [("torso", torso_std), ("knee", knee_std), ("elbow", elbow_std)]
-        main_sig = max(stds, key=lambda x: x[1])[0]
-        if main_sig == "torso":
-            reps = count_reps_from_series(torso_sm, low_th=np.percentile(torso_sm, 30), high_th=np.percentile(torso_sm, 70))
-        elif main_sig == "knee":
-            reps = count_reps_from_series(knee_sm, low_th=np.percentile(knee_sm, 30), high_th=np.percentile(knee_sm, 70))
-        else:
-            reps = count_reps_from_series(elbow_sm, low_th=np.percentile(elbow_sm, 30), high_th=np.percentile(elbow_sm, 70))
-        metric_value = float(max(0, reps))
-        posture_quality = "unknown"
-        stability = "medium"
-        intensity = "moderate"
-        notes.append("어떤 한 가지 운동 패턴으로 보기 어려워 혼합/기타 동작으로 분류했습니다.")
-
-    analysis = {
-        "exercise_key": exercise_key,
-        "exercise_name_kr": EXERCISE_KEY_TO_NAME_KR.get(exercise_key, "알 수 없음"),
-        "reps": int(reps),
-        "metric_type": metric_type,
-        "metric_value": float(metric_value),
-        "posture_quality": posture_quality,
-        "intensity": intensity,
-        "stability": stability,
-        "notes": " / ".join(notes),
-        "video_duration_sec": float(duration),
-        "stats": {
-            "torso_mean": torso_mean,
-            "torso_std": torso_std,
-            "knee_std": knee_std,
-            "elbow_std": elbow_std,
-            "hip_std": hip_std,
-        },
-    }
-
-    return analysis, preview_frames[:4]
 
 # ============================================================
-# 6. 점수 계산
+# 3. 국민체력100 점수 계산 로직 (수동 입력 버전)
 # ============================================================
 
-def lookup_kfta_score(exercise_key: str, gender: str, age_group: str, value: float) -> Tuple[int, int, str, str]:
+def lookup_kfta_score(
+    exercise_key: str,
+    gender: str,
+    age_group: str,
+    value: float,
+) -> Tuple[int, int, str, str]:
+    """
+    exercise_key, gender('남성'/'여성'), age_group('20대' 등), 측정값(value)을 기반으로
+    국민체력100 점수표에서 점수 찾기.
+
+    return: (score, grade, level_label, remark)
+    """
     gender_key = "male" if gender == "남성" else "female"
 
+    # 공식 항목이 아닌 운동은 연구용 점수 처리
     if exercise_key in NON_KFTA_EXERCISES or exercise_key not in KFTA_SCORES:
-        max_ref = 50.0
+        max_ref = 50.0  # 0~50 범위를 0~100으로 단순 정규화 (연구용)
         score = int(max(0, min(100, value / max_ref * 100)))
+
         if score >= 90:
             grade, level = 1, "매우 우수(연구용)"
         elif score >= 75:
@@ -439,20 +214,22 @@ def lookup_kfta_score(exercise_key: str, gender: str, age_group: str, value: flo
             grade, level = 4, "주의 필요(연구용)"
         else:
             grade, level = 5, "개선 필요(연구용)"
-        remark = "해당 운동은 국민체력100 공식 항목이 아니거나 점수표가 없어 연구용 점수로 환산했습니다."
+
+        remark = "해당 운동은 국민체력100 공식 기준이 아니므로 연구용 점수로 산정했습니다."
         return score, grade, level, remark
 
+    # 공식 KFTA 항목
     table_exc = KFTA_SCORES.get(exercise_key, {})
     table_gender = table_exc.get(gender_key, {})
     thresholds = table_gender.get(age_group, [])
 
     if not thresholds:
-        return 0, 0, "점수표 없음", "해당 연령/성별에 대한 점수표가 등록되어 있지 않습니다."
+        return 0, 0, "점수표 없음", "해당 연령/성별 조합의 국민체력100 기준표가 등록되어 있지 않습니다."
 
     score = 0
-    for v_min, s in thresholds:
+    for v_min, sc in thresholds:
         if value >= v_min:
-            score = s
+            score = sc
             break
 
     if score >= 90:
@@ -466,113 +243,211 @@ def lookup_kfta_score(exercise_key: str, gender: str, age_group: str, value: flo
     else:
         grade, level = 5, "개선 필요"
 
-    remark = "점수표 수치는 예시값입니다. 실제 국민체력100 공식 기준으로 교체해 사용해야 합니다."
+    remark = "점수는 예시 값입니다. 실제 국민체력100 공식 기준값으로 교체해 사용해야 합니다."
     return score, grade, level, remark
 
-# ============================================================
-# 7. Streamlit UI
-# ============================================================
 
-with st.sidebar:
-    st.header("⚙️ 설정")
-    age_group = st.selectbox("연령대", ["10대", "20대", "30대", "40대", "50대", "60대 이상"], index=1)
-    gender = st.selectbox("성별", ["남성", "여성"], index=0)
-    st.markdown("---")
-    st.markdown(
-        """
-**분석 방식**
-
-- MediaPipe Pose로 관절 추출
-- 간단한 규칙 기반으로 운동 분류 및 반복 수 추정
-- KFTA 예시 점수표로 점수 환산
-"""
-    )
-
-col_left, col_right = st.columns([1, 2])
-
-with col_left:
-    st.subheader("1️⃣ 영상 업로드")
-    video_file = st.file_uploader("운동 영상(mp4)", type=["mp4"])
-    analyze_button = st.button("🔍 분석 실행", type="primary")
-
-with col_right:
-    st.subheader("2️⃣ 영상 미리보기")
-    if video_file is not None:
-        st.video(video_file)
-    else:
-        st.info("왼쪽에서 mp4 파일을 업로드하면 이곳에서 미리 볼 수 있습니다.")
-
-st.markdown("---")
-
-if analyze_button:
-    if video_file is None:
-        st.error("먼저 mp4 영상을 업로드해 주세요.")
-        st.stop()
-
-    video_bytes = video_file.getvalue()
-
-    try:
-        with st.spinner("🎞 MediaPipe Pose로 영상 분석 중..."):
-            analysis, preview_frames = analyze_video_with_mediapipe(video_bytes)
-    except Exception as e:
-        st.error(f"영상 분석 중 오류가 발생했습니다: {e}")
-        st.stop()
-
-    st.success("분석 완료!")
-
-    st.subheader("3️⃣ 대표 프레임")
-    cols = st.columns(len(preview_frames))
-    for i, frame in enumerate(preview_frames):
-        cols[i].image(frame, caption=f"Frame {i+1}", use_container_width=True)
-
-    st.markdown("---")
-    st.subheader("4️⃣ 운동 분류 및 반복 수 추정")
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.metric("운동 분류", f"{analysis['exercise_name_kr']} ({analysis['exercise_key']})")
-    with c2:
-        if analysis["metric_type"] == "seconds":
-            st.metric("유지 시간", f"{analysis['metric_value']:.1f} 초")
-        else:
-            st.metric("반복 수(추정)", f"{analysis['metric_value']:.0f} 회")
-    with c3:
-        st.metric("영상 길이", f"{analysis['video_duration_sec']:.1f} 초")
-
-    st.write(
-        f"- 자세 품질: **{analysis['posture_quality']}**  \n"
-        f"- 강도: **{analysis['intensity']}**  \n"
-        f"- 안정성: **{analysis['stability']}**"
-    )
-
-    if analysis["notes"]:
-        st.info("추정 근거 / 코멘트: " + analysis["notes"])
-
-    st.markdown("---")
-    st.subheader("5️⃣ 국민체력100 점수 (예시 환산)")
-
-    metric_value = analysis["metric_value"]
-    # 플랭크는 초 단위 그대로, 나머지는 반복 수로 사용
-    score, grade, level_label, remark = lookup_kfta_score(
-        exercise_key=analysis["exercise_key"],
+def compute_score_manual(
+    exercise_key: str,
+    gender: str,
+    age_group: str,
+    metric_value: float,
+) -> Dict[str, Any]:
+    """
+    UI에서 선택한 운동, 연령대/성별, 수동으로 입력한 기록값을 바탕으로 점수 계산.
+    """
+    score, grade, level, remark = lookup_kfta_score(
+        exercise_key=exercise_key,
         gender=gender,
         age_group=age_group,
         value=metric_value,
     )
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.metric("점수 (0~100)", f"{score} 점")
-    with c2:
-        if grade > 0:
-            st.metric("등급", f"{grade} 등급")
-        else:
-            st.metric("등급", "기준 없음")
-    with c3:
-        st.metric("평가", level_label)
+    return {
+        "exercise_key": exercise_key,
+        "exercise_name_kr": EXERCISE_KEY_TO_NAME_KR.get(exercise_key, "알 수 없음"),
+        "metric_value": metric_value,
+        "score": score,
+        "grade": grade,
+        "level_label": level,
+        "remark": remark,
+    }
 
-    st.caption(remark)
+
+# ============================================================
+# 4. Streamlit UI (영상 미리보기 + 수동 기록 입력 + 점수 계산)
+# ============================================================
+
+def main():
+    st.set_page_config(page_title="국민체력100 점수 도우미 (영상 + 수동 입력)", layout="wide")
+
+    st.title("🏃‍♂️ 국민체력100 영상 + 수동 기록 기반 점수 계산 데모")
+    st.markdown(
+        """
+업로드한 **운동 영상(mp4)**을 미리 보고,  
+직접 측정한 **기록(횟수·시간·왕복 수)**을 입력하면  
+국민체력100 예시 기준에 따라 점수를 계산해 주는 도구입니다.
+
+자동 포즈 인식/AI 분석은 현재 Streamlit Cloud의 Python 3.13 환경 제약으로 인해 제외되어 있습니다.
+대신 점수 계산 로직과 점수표 구조는 그대로 유지되어,  
+공식 기준표 수치를 그대로 넣어 사용할 수 있는 형태로 설계되어 있습니다.
+"""
+    )
+
+    # 좌/우 레이아웃
+    col_left, col_right = st.columns([1, 2])
+
+    with col_left:
+        st.subheader("1️⃣ 기본 정보 및 기록 입력")
+
+        age_group = st.selectbox(
+            "연령대",
+            ["10대", "20대", "30대", "40대", "50대", "60대 이상"],
+            index=1,
+            help="국민체력100 기준과 연동될 연령대입니다.",
+        )
+
+        gender = st.selectbox(
+            "성별",
+            ["남성", "여성"],
+            index=0,
+        )
+
+        # 운동 선택
+        st.markdown("#### 운동 종류 선택")
+        exercise_key = st.selectbox(
+            "운동 종목",
+            options=list(EXERCISE_KEY_TO_NAME_KR.keys()),
+            format_func=lambda k: f"{EXERCISE_KEY_TO_NAME_KR[k]} ({k})",
+        )
+
+        # 운동별 기록 단위 안내
+        if exercise_key == "plank":
+            metric_label = "기록 입력 (버틴 시간, 초 단위)"
+            metric_help = "예: 60초 버티면 60 입력"
+        elif exercise_key == "shuttle_run":
+            metric_label = "기록 입력 (완료한 왕복 횟수)"
+            metric_help = "예: beep test에서 35회 왕복 완료 → 35 입력"
+        else:
+            metric_label = "기록 입력 (완료한 반복 횟수)"
+            metric_help = "예: 1분 동안 30회 수행 → 30 입력"
+
+        metric_value = st.number_input(
+            metric_label,
+            min_value=0.0,
+            step=1.0,
+            format="%.1f",
+            help=metric_help,
+        )
+
+        st.subheader("2️⃣ 영상 업로드 (선택)")
+        video_file = st.file_uploader(
+            "운동 영상 업로드 (mp4 형식, 선택 사항)",
+            type=["mp4"],
+            accept_multiple_files=False,
+            help="영상은 점수를 계산하는 데 필수는 아니며, 미리보기용으로 사용됩니다.",
+        )
+
+        analyze_button = st.button("🧮 점수 계산하기", type="primary")
+
+    with col_right:
+        st.subheader("3️⃣ 업로드된 영상 미리보기")
+        if video_file is not None:
+            st.video(video_file)
+        else:
+            st.info("왼쪽에서 mp4 파일을 업로드하면 여기에서 미리 볼 수 있습니다.")
 
     st.markdown("---")
-    st.subheader("6️⃣ 내부 분석 값 (디버그용)")
-    st.json(analysis["stats"])
+
+    # 분석/계산 실행
+    if analyze_button:
+        video_duration = None
+        frames: List[np.ndarray] = []
+
+        # 영상이 있을 경우에만 프레임 추출
+        if video_file is not None:
+            try:
+                video_bytes = video_file.getvalue()
+                with st.spinner("🎞 영상에서 대표 프레임 추출 중..."):
+                    frames, video_duration = extract_frames_from_video_bytes(
+                        video_bytes,
+                        num_frames=4,
+                    )
+                st.success(f"프레임 {len(frames)}장 추출 완료 (영상 길이 약 {video_duration:.1f}초)")
+            except Exception as e:
+                st.error(f"프레임 추출 중 오류가 발생했습니다 (점수 계산에는 영향을 주지 않습니다): {e}")
+
+            if frames:
+                st.subheader("4️⃣ 추출된 대표 프레임")
+                cols = st.columns(min(len(frames), 4))
+                for i, frame in enumerate(frames):
+                    cols[i % len(cols)].image(frame, caption=f"Frame {i+1}", use_container_width=True)
+        else:
+            st.info("영상 없이도 기록만으로 점수 계산이 가능합니다.")
+
+        # 점수 계산
+        try:
+            if metric_value <= 0:
+                st.warning("기록 값이 0 이하입니다. 실제 측정값을 입력하면 더 의미 있는 점수가 계산됩니다.")
+            score_result = compute_score_manual(
+                exercise_key=exercise_key,
+                gender=gender,
+                age_group=age_group,
+                metric_value=metric_value,
+            )
+        except Exception as e:
+            st.error(f"점수 계산 중 오류가 발생했습니다: {e}")
+            st.stop()
+
+        st.markdown("---")
+        st.subheader("5️⃣ 점수 계산 결과")
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric(
+                "운동 종목",
+                f"{score_result['exercise_name_kr']} ({score_result['exercise_key']})",
+            )
+        with c2:
+            st.metric(
+                "입력 기록",
+                f"{score_result['metric_value']:.1f}",
+            )
+        with c3:
+            st.metric("점수 (0~100)", f"{score_result['score']} 점")
+
+        c4, c5 = st.columns(2)
+        with c4:
+            if score_result["grade"] > 0:
+                st.metric("등급 (1~5)", f"{score_result['grade']} 등급")
+            else:
+                st.metric("등급 (1~5)", "기준 없음")
+        with c5:
+            st.metric("평가", score_result["level_label"])
+
+        st.caption(score_result["remark"])
+
+        st.markdown("---")
+        st.subheader("6️⃣ 디버깅/연구용 JSON 출력")
+
+        result_payload = {
+            "input": {
+                "age_group": age_group,
+                "gender": gender,
+                "exercise_key": exercise_key,
+                "exercise_name_kr": EXERCISE_KEY_TO_NAME_KR.get(exercise_key),
+                "metric_value": metric_value,
+                "video_duration_sec": video_duration,
+            },
+            "score_result": score_result,
+        }
+
+        st.json(result_payload)
+
+
+# ============================================================
+# 5. 실행
+# ============================================================
+
+if __name__ == "__main__":
+    main()
