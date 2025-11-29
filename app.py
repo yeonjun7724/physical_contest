@@ -14,6 +14,11 @@ from openai import OpenAI
 # OpenAI Client (환경변수 자동 인식)
 # ------------------------------
 # 기존: client = OpenAI(api_key=OPENAI_API_KEY)
+
+# Disable Railway's injected proxy settings (critical fix)
+for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]:
+    os.environ.pop(key, None)
+
 client = OpenAI()   # ← THIS FIXES THE ERROR
 
 # ------------------------------
