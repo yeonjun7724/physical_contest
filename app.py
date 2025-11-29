@@ -1,453 +1,193 @@
 import os
 import io
+import cv2
+import base64
 import json
 import time
 import tempfile
-from typing import List, Dict, Any, Optional, Tuple
-
-import cv2
 import numpy as np
 from PIL import Image
 import streamlit as st
+from openai import OpenAI
 
-# ============================================================
-# 1. 국민체력100 점수 테이블 (예시 값 유지)
-# ============================================================
+# ------------------------------
+# OpenAI Client
+# ------------------------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-"""
-실제 국민체력100 공식 점수표를 그대로 옮겨서 아래 딕셔너리에 넣으면 됨.
-현재 숫자는 "예시 값"이므로, 반드시 공식 자료 보고 수정해야 함.
-
-구조:
-KFTA_SCORES[exercise_key][gender][age_group] = [
-    (기준값, 점수),
-    (기준값, 점수),
-    ...
-    (0, 0)
-]
-
-- exercise_key: "situp", "pushup", "plank", "shuttle_run" 등
-- gender: "male", "female"
-- age_group: "10대", "20대", "30대", "40대", "50대", "60대 이상"
-- situp/pushup 등: reps(횟수) 기준, plank: seconds(초), shuttle_run: 왕복 횟수 등
-"""
-
-KFTA_SCORES: Dict[str, Dict[str, Dict[str, List[Tuple[float, int]]]]] = {
-    # 윗몸일으키기 (예시 값)
+# ------------------------------
+# 국민체력 정보 (예시값 그대로)
+# ------------------------------
+KFTA_SCORES = {
     "situp": {
         "male": {
-            "10대": [(55, 100), (50, 90), (45, 80), (40, 70), (35, 60), (30, 50), (25, 40), (20, 30), (15, 20), (10, 10), (0, 0)],
-            "20대": [(52, 100), (47, 90), (42, 80), (37, 70), (32, 60), (27, 50), (22, 40), (17, 30), (12, 20), (7, 10), (0, 0)],
-            "30대": [(48, 100), (43, 90), (38, 80), (33, 70), (28, 60), (23, 50), (18, 40), (13, 30), (8, 20), (4, 10), (0, 0)],
-            "40대": [(44, 100), (39, 90), (34, 80), (29, 70), (24, 60), (19, 50), (14, 40), (9, 30), (5, 20), (2, 10), (0, 0)],
-            "50대": [(40, 100), (35, 90), (30, 80), (25, 70), (20, 60), (15, 50), (10, 40), (7, 30), (4, 20), (2, 10), (0, 0)],
-            "60대 이상": [(35, 100), (30, 90), (25, 80), (20, 70), (15, 60), (10, 50), (7, 40), (4, 30), (2, 20), (1, 10), (0, 0)],
+            "20대": [(52, 100), (47, 90), (42, 80), (37, 70), (32, 60), (27, 50), (22, 40), (17, 30), (12, 20), (7, 10), (0, 0)]
         },
         "female": {
-            "10대": [(50, 100), (45, 90), (40, 80), (35, 70), (30, 60), (25, 50), (20, 40), (15, 30), (10, 20), (5, 10), (0, 0)],
-            "20대": [(45, 100), (40, 90), (35, 80), (30, 70), (25, 60), (20, 50), (15, 40), (10, 30), (7, 20), (3, 10), (0, 0)],
-            "30대": [(40, 100), (35, 90), (30, 80), (25, 70), (20, 60), (15, 50), (10, 40), (7, 30), (4, 20), (2, 10), (0, 0)],
-            "40대": [(36, 100), (31, 90), (26, 80), (21, 70), (16, 60), (11, 50), (8, 40), (5, 30), (3, 20), (1, 10), (0, 0)],
-            "50대": [(32, 100), (27, 90), (22, 80), (17, 70), (12, 60), (9, 50), (6, 40), (4, 30), (2, 20), (1, 10), (0, 0)],
-            "60대 이상": [(28, 100), (23, 90), (18, 80), (13, 70), (9, 60), (6, 50), (4, 40), (2, 30), (1, 20), (0, 10), (0, 0)],
+            "20대": [(45, 100), (40, 90), (35, 80), (30, 70), (25, 60), (20, 50), (15, 40), (10, 30), (7, 20), (3, 10), (0, 0)]
         },
     },
-    # 팔굽혀펴기 (예시 값)
     "pushup": {
         "male": {
-            "10대": [(45, 100), (40, 90), (35, 80), (30, 70), (25, 60), (20, 50), (15, 40), (10, 30), (5, 20), (2, 10), (0, 0)],
-            "20대": [(42, 100), (37, 90), (32, 80), (27, 70), (22, 60), (17, 50), (12, 40), (8, 30), (4, 20), (2, 10), (0, 0)],
-            "30대": [(38, 100), (33, 90), (28, 80), (23, 70), (18, 60), (13, 50), (9, 40), (5, 30), (3, 20), (1, 10), (0, 0)],
-            "40대": [(34, 100), (29, 90), (24, 80), (19, 70), (14, 60), (10, 50), (7, 40), (4, 30), (2, 20), (1, 10), (0, 0)],
-            "50대": [(30, 100), (25, 90), (20, 80), (15, 70), (11, 60), (8, 50), (5, 40), (3, 30), (2, 20), (1, 10), (0, 0)],
-            "60대 이상": [(26, 100), (21, 90), (16, 80), (12, 70), (9, 60), (6, 50), (4, 40), (2, 30), (1, 20), (0, 10), (0, 0)],
+            "20대": [(42, 100), (37, 90), (32, 80), (27, 70), (22, 60), (17, 50), (12, 40), (8, 30), (4, 20), (2, 10), (0, 0)]
         },
         "female": {
-            "10대": [(35, 100), (30, 90), (25, 80), (20, 70), (16, 60), (12, 50), (8, 40), (5, 30), (3, 20), (1, 10), (0, 0)],
-            "20대": [(32, 100), (27, 90), (22, 80), (18, 70), (14, 60), (10, 50), (7, 40), (4, 30), (2, 20), (1, 10), (0, 0)],
-            "30대": [(28, 100), (23, 90), (18, 80), (14, 70), (11, 60), (8, 50), (5, 40), (3, 30), (2, 20), (1, 10), (0, 0)],
-            "40대": [(24, 100), (19, 90), (15, 80), (11, 70), (8, 60), (6, 50), (4, 40), (2, 30), (1, 20), (0, 10), (0, 0)],
-            "50대": [(20, 100), (16, 90), (12, 80), (9, 70), (7, 60), (5, 50), (3, 40), (2, 30), (1, 20), (0, 10), (0, 0)],
-            "60대 이상": [(16, 100), (13, 90), (10, 80), (7, 70), (5, 60), (3, 50), (2, 40), (1, 30), (0, 20), (0, 10), (0, 0)],
-        },
-    },
-    # 플랭크 (초 단위, 예시)
-    "plank": {
-        "male": {
-            "10대": [(180, 100), (150, 90), (120, 80), (90, 70), (60, 60), (45, 50), (30, 40), (20, 30), (10, 20), (5, 10), (0, 0)],
-            "20대": [(180, 100), (150, 90), (120, 80), (90, 70), (60, 60), (45, 50), (30, 40), (20, 30), (10, 20), (5, 10), (0, 0)],
-            "30대": [(150, 100), (130, 90), (110, 80), (90, 70), (70, 60), (50, 50), (35, 40), (25, 30), (15, 20), (5, 10), (0, 0)],
-            "40대": [(140, 100), (120, 90), (100, 80), (80, 70), (60, 60), (45, 50), (30, 40), (20, 30), (10, 20), (5, 10), (0, 0)],
-            "50대": [(120, 100), (100, 90), (80, 80), (60, 70), (45, 60), (30, 50), (20, 40), (10, 30), (5, 20), (3, 10), (0, 0)],
-            "60대 이상": [(100, 100), (80, 90), (60, 80), (45, 70), (30, 60), (20, 50), (10, 40), (5, 30), (3, 20), (1, 10), (0, 0)],
-        },
-        "female": {
-            "10대": [(150, 100), (130, 90), (110, 80), (90, 70), (70, 60), (50, 50), (35, 40), (25, 30), (15, 20), (5, 10), (0, 0)],
-            "20대": [(150, 100), (130, 90), (110, 80), (90, 70), (70, 60), (50, 50), (35, 40), (25, 30), (15, 20), (5, 10), (0, 0)],
-            "30대": [(130, 100), (110, 90), (90, 80), (70, 70), (55, 60), (40, 50), (28, 40), (18, 30), (10, 20), (5, 10), (0, 0)],
-            "40대": [(110, 100), (90, 90), (75, 80), (60, 70), (45, 60), (30, 50), (20, 40), (12, 30), (7, 20), (3, 10), (0, 0)],
-            "50대": [(100, 100), (80, 90), (65, 80), (50, 70), (35, 60), (25, 50), (15, 40), (9, 30), (5, 20), (2, 10), (0, 0)],
-            "60대 이상": [(90, 100), (70, 90), (55, 80), (40, 70), (28, 60), (18, 50), (10, 40), (6, 30), (3, 20), (1, 10), (0, 0)],
-        },
-    },
-    # 왕복 오래달리기 (왕복 수, 예시 값)
-    "shuttle_run": {
-        "male": {
-            "10대": [(60, 100), (55, 90), (50, 80), (45, 70), (40, 60), (35, 50), (30, 40), (25, 30), (20, 20), (15, 10), (0, 0)],
-            "20대": [(55, 100), (50, 90), (45, 80), (40, 70), (35, 60), (30, 50), (25, 40), (20, 30), (15, 20), (10, 10), (0, 0)],
-            "30대": [(50, 100), (45, 90), (40, 80), (35, 70), (30, 60), (25, 50), (20, 40), (15, 30), (10, 20), (5, 10), (0, 0)],
-            "40대": [(45, 100), (40, 90), (35, 80), (30, 70), (25, 60), (20, 50), (15, 40), (10, 30), (7, 20), (3, 10), (0, 0)],
-            "50대": [(40, 100), (35, 90), (30, 80), (25, 70), (20, 60), (15, 50), (10, 40), (7, 30), (4, 20), (2, 10), (0, 0)],
-            "60대 이상": [(35, 100), (30, 90), (25, 80), (20, 70), (15, 60), (10, 50), (7, 40), (4, 30), (2, 20), (1, 10), (0, 0)],
-        },
-        "female": {
-            "10대": [(50, 100), (45, 90), (40, 80), (35, 70), (30, 60), (25, 50), (20, 40), (15, 30), (10, 20), (5, 10), (0, 0)],
-            "20대": [(45, 100), (40, 90), (35, 80), (30, 70), (25, 60), (20, 50), (15, 40), (10, 30), (7, 20), (3, 10), (0, 0)],
-            "30대": [(40, 100), (35, 90), (30, 80), (25, 70), (20, 60), (15, 50), (10, 40), (7, 30), (4, 20), (2, 10), (0, 0)],
-            "40대": [(35, 100), (30, 90), (25, 80), (20, 70), (16, 60), (12, 50), (8, 40), (5, 30), (3, 20), (1, 10), (0, 0)],
-            "50대": [(30, 100), (25, 90), (20, 80), (16, 70), (12, 60), (9, 50), (6, 40), (4, 30), (2, 20), (1, 10), (0, 0)],
-            "60대 이상": [(25, 100), (20, 90), (16, 80), (12, 70), (9, 60), (6, 50), (4, 40), (2, 30), (1, 20), (0, 10), (0, 0)],
+            "20대": [(32, 100), (27, 90), (22, 80), (18, 70), (14, 60), (10, 50), (7, 40), (4, 30), (2, 20), (1, 10), (0, 0)]
         },
     },
 }
 
-# 공식 항목이 아닌 운동은 "연구용 점수" 처리
-NON_KFTA_EXERCISES = {"squat", "burpee", "lunge", "jump", "mixed"}
-
-EXERCISE_KEY_TO_NAME_KR = {
+EXERCISE_NAMES = {
     "situp": "윗몸일으키기",
     "pushup": "팔굽혀펴기",
     "squat": "스쿼트",
     "plank": "플랭크",
     "burpee": "버피",
     "lunge": "런지",
-    "jump": "제자리 점프/스텝박스 점프",
+    "jump": "점프",
     "shuttle_run": "왕복 오래달리기",
-    "mixed": "종합 체력 측정(혼합 동작)",
+    "mixed": "혼합 동작",
 }
 
+NON_KFTA = {"squat", "lunge", "jump", "burpee", "mixed"}
 
-# ============================================================
-# 2. 비디오 → 프레임 추출 (OpenCV만 사용)
-# ============================================================
-
-def extract_frames_from_video_bytes(
-    video_bytes: bytes,
-    num_frames: int = 4,
-    resize_to: Tuple[int, int] = (640, 360),
-) -> Tuple[List[np.ndarray], float]:
-    """
-    mp4 바이트 → 임시파일 → OpenCV로 프레임 균등 추출.
-    return: (frames(RGB np.ndarray list), duration_sec)
-    """
+# ------------------------------
+# 영상에서 프레임 추출
+# ------------------------------
+def extract_frames(video_bytes, num_frames=4, resize=(640, 360)):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
         tmp.write(video_bytes)
         tmp_path = tmp.name
 
     cap = cv2.VideoCapture(tmp_path)
-    if not cap.isOpened():
-        cap.release()
-        os.remove(tmp_path)
-        raise RuntimeError("영상 파일을 열 수 없습니다.")
 
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 0.000001
-    duration_sec = frame_count / fps if frame_count > 0 else 0.0
+    fps = cap.get(cv2.CAP_PROP_FPS) or 1
+    duration = frame_count / fps
 
-    if frame_count <= 0:
-        cap.release()
-        os.remove(tmp_path)
-        raise RuntimeError("영상에서 프레임 정보를 읽을 수 없습니다.")
+    idxs = np.linspace(0, frame_count - 1, num_frames).astype(int)
 
-    # 균등 간격 인덱스
-    idxs = np.linspace(0, frame_count - 1, num_frames, dtype=int)
-
-    frames: List[np.ndarray] = []
+    frames = []
     for idx in idxs:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ret, frame = cap.read()
         if not ret:
             continue
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame = cv2.resize(frame, resize_to)
+        frame = cv2.resize(frame, resize)
         frames.append(frame)
 
     cap.release()
     os.remove(tmp_path)
 
-    if not frames:
-        raise RuntimeError("프레임을 추출하지 못했습니다.")
-
-    return frames, float(duration_sec)
+    return frames, duration
 
 
-# ============================================================
-# 3. 국민체력100 점수 계산 로직 (수동 입력 버전)
-# ============================================================
+# ------------------------------
+# 프레임 → base64
+# ------------------------------
+def pil_to_b64(img):
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG")
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    return f"data:image/jpeg;base64,{b64}"
 
-def lookup_kfta_score(
-    exercise_key: str,
-    gender: str,
-    age_group: str,
-    value: float,
-) -> Tuple[int, int, str, str]:
-    """
-    exercise_key, gender('남성'/'여성'), age_group('20대' 등), 측정값(value)을 기반으로
-    국민체력100 점수표에서 점수 찾기.
 
-    return: (score, grade, level_label, remark)
-    """
+# ------------------------------
+# OpenAI VLM 분석
+# ------------------------------
+def analyze_frames(frames, duration):
+    images_payload = [
+        {"type": "input_image", "image_url": pil_to_b64(Image.fromarray(f))}
+        for f in frames
+    ]
+
+    prompt = f"""
+당신은 운동 분석 전문가입니다.
+다음 영상의 프레임을 보고 다음 JSON을 반환하세요:
+
+{{
+ "exercise_key": "...",
+ "exercise_name_kr": "...",
+ "estimated_reps": 숫자,
+ "main_metric": {{"type": "reps|seconds", "value": 숫자}},
+ "posture": "좋음|보통|나쁨",
+ "risk": ["항목1", "항목2"]
+}}
+"""
+
+    result = client.responses.create(
+        model="gpt-4o-mini",
+        input=[
+            {"role": "user", "content": [{"type": "text", "text": prompt}, *images_payload]}
+        ]
+    )
+
+    parsed = client.responses.parse(result)
+    return parsed.output[0]
+
+
+# ------------------------------
+# KFTA 점수 계산
+# ------------------------------
+def calc_kfta(exercise_key, gender, age_group, value):
     gender_key = "male" if gender == "남성" else "female"
 
-    # 공식 항목이 아닌 운동은 연구용 점수 처리
-    if exercise_key in NON_KFTA_EXERCISES or exercise_key not in KFTA_SCORES:
-        max_ref = 50.0  # 0~50 범위를 0~100으로 단순 정규화 (연구용)
-        score = int(max(0, min(100, value / max_ref * 100)))
+    if exercise_key in NON_KFTA or exercise_key not in KFTA_SCORES:
+        score = min(100, int(value * 2))
+        grade = 1 if score >= 90 else 2 if score >= 75 else 3 if score >= 60 else 4 if score >= 45 else 5
+        return score, grade, "연구용 평가"
 
-        if score >= 90:
-            grade, level = 1, "매우 우수(연구용)"
-        elif score >= 75:
-            grade, level = 2, "우수(연구용)"
-        elif score >= 60:
-            grade, level = 3, "보통(연구용)"
-        elif score >= 45:
-            grade, level = 4, "주의 필요(연구용)"
-        else:
-            grade, level = 5, "개선 필요(연구용)"
+    table = KFTA_SCORES[exercise_key][gender_key][age_group]
 
-        remark = "해당 운동은 국민체력100 공식 기준이 아니므로 연구용 점수로 산정했습니다."
-        return score, grade, level, remark
-
-    # 공식 KFTA 항목
-    table_exc = KFTA_SCORES.get(exercise_key, {})
-    table_gender = table_exc.get(gender_key, {})
-    thresholds = table_gender.get(age_group, [])
-
-    if not thresholds:
-        return 0, 0, "점수표 없음", "해당 연령/성별 조합의 국민체력100 기준표가 등록되어 있지 않습니다."
-
-    score = 0
-    for v_min, sc in thresholds:
-        if value >= v_min:
+    for threshold, sc in table:
+        if value >= threshold:
             score = sc
             break
 
-    if score >= 90:
-        grade, level = 1, "매우 우수"
-    elif score >= 75:
-        grade, level = 2, "우수"
-    elif score >= 60:
-        grade, level = 3, "보통"
-    elif score >= 45:
-        grade, level = 4, "주의 필요"
-    else:
-        grade, level = 5, "개선 필요"
-
-    remark = "점수는 예시 값입니다. 실제 국민체력100 공식 기준값으로 교체해 사용해야 합니다."
-    return score, grade, level, remark
+    grade = 1 if score >= 90 else 2 if score >= 75 else 3 if score >= 60 else 4 if score >= 45 else 5
+    return score, grade, "국민체력100 기준(예시)"
 
 
-def compute_score_manual(
-    exercise_key: str,
-    gender: str,
-    age_group: str,
-    metric_value: float,
-) -> Dict[str, Any]:
-    """
-    UI에서 선택한 운동, 연령대/성별, 수동으로 입력한 기록값을 바탕으로 점수 계산.
-    """
-    score, grade, level, remark = lookup_kfta_score(
-        exercise_key=exercise_key,
-        gender=gender,
-        age_group=age_group,
-        value=metric_value,
-    )
+# ------------------------------
+# Streamlit UI
+# ------------------------------
+st.set_page_config(page_title="AI 국민체력 분석", layout="wide")
 
-    return {
-        "exercise_key": exercise_key,
-        "exercise_name_kr": EXERCISE_KEY_TO_NAME_KR.get(exercise_key, "알 수 없음"),
-        "metric_value": metric_value,
-        "score": score,
-        "grade": grade,
-        "level_label": level,
-        "remark": remark,
-    }
+st.title("🏃 AI 기반 국민체력 영상 분석")
 
+with st.sidebar:
+    st.header("⚙ 설정")
+    age = st.selectbox("연령대", ["20대"])
+    gender = st.selectbox("성별", ["남성", "여성"])
 
-# ============================================================
-# 4. Streamlit UI (영상 미리보기 + 수동 기록 입력 + 점수 계산)
-# ============================================================
+st.write("아래에 운동 영상을 업로드하면 자동 분석합니다.")
 
-def main():
-    st.set_page_config(page_title="국민체력100 점수 도우미 (영상 + 수동 입력)", layout="wide")
+video_file = st.file_uploader("MP4 영상 업로드", type=["mp4"])
 
-    st.title("🏃‍♂️ 국민체력100 영상 + 수동 기록 기반 점수 계산 데모")
-    st.markdown(
-        """
-업로드한 **운동 영상(mp4)**을 미리 보고,  
-직접 측정한 **기록(횟수·시간·왕복 수)**을 입력하면  
-국민체력100 예시 기준에 따라 점수를 계산해 주는 도구입니다.
+if st.button("분석 시작"):
+    if not video_file:
+        st.error("먼저 영상을 업로드하세요.")
+        st.stop()
 
-자동 포즈 인식/AI 분석은 현재 Streamlit Cloud의 Python 3.13 환경 제약으로 인해 제외되어 있습니다.
-대신 점수 계산 로직과 점수표 구조는 그대로 유지되어,  
-공식 기준표 수치를 그대로 넣어 사용할 수 있는 형태로 설계되어 있습니다.
-"""
-    )
+    with st.spinner("프레임 추출 중..."):
+        frames, duration = extract_frames(video_file.read(), num_frames=4)
 
-    # 좌/우 레이아웃
-    col_left, col_right = st.columns([1, 2])
+    with st.spinner("AI 분석 중..."):
+        analysis = analyze_frames(frames, duration)
 
-    with col_left:
-        st.subheader("1️⃣ 기본 정보 및 기록 입력")
+    st.success("AI 분석 완료!")
 
-        age_group = st.selectbox(
-            "연령대",
-            ["10대", "20대", "30대", "40대", "50대", "60대 이상"],
-            index=1,
-            help="국민체력100 기준과 연동될 연령대입니다.",
-        )
+    st.write("### 📌 운동 분석 결과")
+    st.json(analysis)
 
-        gender = st.selectbox(
-            "성별",
-            ["남성", "여성"],
-            index=0,
-        )
+    key = analysis["exercise_key"]
+    metric = analysis["main_metric"]["value"]
 
-        # 운동 선택
-        st.markdown("#### 운동 종류 선택")
-        exercise_key = st.selectbox(
-            "운동 종목",
-            options=list(EXERCISE_KEY_TO_NAME_KR.keys()),
-            format_func=lambda k: f"{EXERCISE_KEY_TO_NAME_KR[k]} ({k})",
-        )
+    score, grade, remark = calc_kfta(key, gender, age, metric)
 
-        # 운동별 기록 단위 안내
-        if exercise_key == "plank":
-            metric_label = "기록 입력 (버틴 시간, 초 단위)"
-            metric_help = "예: 60초 버티면 60 입력"
-        elif exercise_key == "shuttle_run":
-            metric_label = "기록 입력 (완료한 왕복 횟수)"
-            metric_help = "예: beep test에서 35회 왕복 완료 → 35 입력"
-        else:
-            metric_label = "기록 입력 (완료한 반복 횟수)"
-            metric_help = "예: 1분 동안 30회 수행 → 30 입력"
-
-        metric_value = st.number_input(
-            metric_label,
-            min_value=0.0,
-            step=1.0,
-            format="%.1f",
-            help=metric_help,
-        )
-
-        st.subheader("2️⃣ 영상 업로드 (선택)")
-        video_file = st.file_uploader(
-            "운동 영상 업로드 (mp4 형식, 선택 사항)",
-            type=["mp4"],
-            accept_multiple_files=False,
-            help="영상은 점수를 계산하는 데 필수는 아니며, 미리보기용으로 사용됩니다.",
-        )
-
-        analyze_button = st.button("🧮 점수 계산하기", type="primary")
-
-    with col_right:
-        st.subheader("3️⃣ 업로드된 영상 미리보기")
-        if video_file is not None:
-            st.video(video_file)
-        else:
-            st.info("왼쪽에서 mp4 파일을 업로드하면 여기에서 미리 볼 수 있습니다.")
-
-    st.markdown("---")
-
-    # 분석/계산 실행
-    if analyze_button:
-        video_duration = None
-        frames: List[np.ndarray] = []
-
-        # 영상이 있을 경우에만 프레임 추출
-        if video_file is not None:
-            try:
-                video_bytes = video_file.getvalue()
-                with st.spinner("🎞 영상에서 대표 프레임 추출 중..."):
-                    frames, video_duration = extract_frames_from_video_bytes(
-                        video_bytes,
-                        num_frames=4,
-                    )
-                st.success(f"프레임 {len(frames)}장 추출 완료 (영상 길이 약 {video_duration:.1f}초)")
-            except Exception as e:
-                st.error(f"프레임 추출 중 오류가 발생했습니다 (점수 계산에는 영향을 주지 않습니다): {e}")
-
-            if frames:
-                st.subheader("4️⃣ 추출된 대표 프레임")
-                cols = st.columns(min(len(frames), 4))
-                for i, frame in enumerate(frames):
-                    cols[i % len(cols)].image(frame, caption=f"Frame {i+1}", use_container_width=True)
-        else:
-            st.info("영상 없이도 기록만으로 점수 계산이 가능합니다.")
-
-        # 점수 계산
-        try:
-            if metric_value <= 0:
-                st.warning("기록 값이 0 이하입니다. 실제 측정값을 입력하면 더 의미 있는 점수가 계산됩니다.")
-            score_result = compute_score_manual(
-                exercise_key=exercise_key,
-                gender=gender,
-                age_group=age_group,
-                metric_value=metric_value,
-            )
-        except Exception as e:
-            st.error(f"점수 계산 중 오류가 발생했습니다: {e}")
-            st.stop()
-
-        st.markdown("---")
-        st.subheader("5️⃣ 점수 계산 결과")
-
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.metric(
-                "운동 종목",
-                f"{score_result['exercise_name_kr']} ({score_result['exercise_key']})",
-            )
-        with c2:
-            st.metric(
-                "입력 기록",
-                f"{score_result['metric_value']:.1f}",
-            )
-        with c3:
-            st.metric("점수 (0~100)", f"{score_result['score']} 점")
-
-        c4, c5 = st.columns(2)
-        with c4:
-            if score_result["grade"] > 0:
-                st.metric("등급 (1~5)", f"{score_result['grade']} 등급")
-            else:
-                st.metric("등급 (1~5)", "기준 없음")
-        with c5:
-            st.metric("평가", score_result["level_label"])
-
-        st.caption(score_result["remark"])
-
-        st.markdown("---")
-        st.subheader("6️⃣ 디버깅/연구용 JSON 출력")
-
-        result_payload = {
-            "input": {
-                "age_group": age_group,
-                "gender": gender,
-                "exercise_key": exercise_key,
-                "exercise_name_kr": EXERCISE_KEY_TO_NAME_KR.get(exercise_key),
-                "metric_value": metric_value,
-                "video_duration_sec": video_duration,
-            },
-            "score_result": score_result,
-        }
-
-        st.json(result_payload)
-
-
-# ============================================================
-# 5. 실행
-# ============================================================
-
-if __name__ == "__main__":
-    main()
+    st.write("### 🏅 국민체력 점수")
+    st.metric("점수", f"{score}점")
+    st.metric("등급", f"{grade}등급")
+    st.caption(remark)
