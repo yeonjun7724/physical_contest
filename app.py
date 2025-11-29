@@ -11,10 +11,10 @@ import streamlit as st
 from openai import OpenAI
 
 # ------------------------------
-# OpenAI Client
+# OpenAI Client (환경변수 자동 인식)
 # ------------------------------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-client = OpenAI(api_key=OPENAI_API_KEY)
+# 기존: client = OpenAI(api_key=OPENAI_API_KEY)
+client = OpenAI()   # ← THIS FIXES THE ERROR
 
 # ------------------------------
 # 국민체력 정보 (예시값 그대로)
@@ -103,18 +103,18 @@ def analyze_frames(frames, duration):
         for f in frames
     ]
 
-    prompt = f"""
+    prompt = """
 당신은 운동 분석 전문가입니다.
 다음 영상의 프레임을 보고 다음 JSON을 반환하세요:
 
-{{
+{
  "exercise_key": "...",
  "exercise_name_kr": "...",
  "estimated_reps": 숫자,
- "main_metric": {{"type": "reps|seconds", "value": 숫자}},
+ "main_metric": {"type": "reps|seconds", "value": 숫자},
  "posture": "좋음|보통|나쁨",
  "risk": ["항목1", "항목2"]
-}}
+}
 """
 
     result = client.responses.create(
